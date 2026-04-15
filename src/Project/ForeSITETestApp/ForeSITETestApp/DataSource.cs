@@ -15,6 +15,20 @@ namespace ForeSITETestApp
         public string? Name { get; set; }
         public string? DataURL { get; set; }
         public string? AppToken { get; set; }
+        public string AppTokenMasked
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(AppToken))
+                    return string.Empty;
+
+                string token = AppToken.Trim();
+                if (token.Length <= 6)
+                    return new string('*', token.Length);
+
+                return $"{token.Substring(0, 3)}***{token.Substring(token.Length - 3)}";
+            }
+        }
         
         public string? ResourceURL { get; set; }
 

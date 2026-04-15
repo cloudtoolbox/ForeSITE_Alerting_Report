@@ -7,12 +7,14 @@
 
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Media.Imaging;
@@ -169,8 +171,15 @@ public partial class MainWindow : Window
                 try
                 {
                     HttpResponseMessage response = await _httpClient.PostAsync("http://127.0.0.1:5001/shutdown", null);
-                    response.EnsureSuccessStatusCode(); // Throws if response is not successful
-                    Console.WriteLine("Shutdown request sent successfully.");
+                    if (response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine("Shutdown request sent successfully.");
+                    }
+                    else
+                    {
+                        // Some Flask hosting modes return 500 even though shutdown proceeds.
+                        Console.WriteLine($"Shutdown request returned {((int)response.StatusCode)}; continuing with local process cleanup.");
+                    }
                 }
                 catch (HttpRequestException ex)
                 {
@@ -217,6 +226,8 @@ public partial class MainWindow : Window
                 // Clean up resources
                 flaskProcess.Close();
                 flaskProcess = null;
+                GlobalLogWriter?.Dispose();
+                GlobalLogWriter = null;
                 _httpClient.Dispose(); // Dispose HttpClient
             }
         }
@@ -384,6 +395,10 @@ public partial class MainWindow : Window
             config["pythonPath"] = pythonPath;
             config["RPath"] = rHomePath;
             config["activateCommand"] = activateCommand;
+            config["serverPath"] = "epyflaServer.py";
+            config["logPath"] = @"Server\flask_log.txt";
+            config["rUserPath"] = @"Server\r_user";
+            config["rLibsUserPath"] = @"Server\r_user\library";
             config["initialized"] = true;
             //config["Initialized"] = true;
 
@@ -432,13 +447,16 @@ public partial class MainWindow : Window
         string serverDirectory = Path.Combine(baseDirectory, "Server");
         string configPath = GetConfigPath();
 
-        dynamic config = new
+        JObject config = new JObject
         {
-            pythonPath = @"epysurv311\python.exe",
-            RPath = @"epysurv311\Lib\R",
-            serverPath = @"epyflaServer.py",
-            activateCommand = @"epysurv311\Scripts\activate.bat",
-            envName = "epysurv311"
+            ["pythonPath"] = @"epysurv311\python.exe",
+            ["RPath"] = @"epysurv311\Lib\R",
+            ["serverPath"] = @"epyflaServer.py",
+            ["activateCommand"] = @"epysurv311\Scripts\activate.bat",
+            ["envName"] = "epysurv311",
+            ["logPath"] = @"Server\flask_log.txt",
+            ["rUserPath"] = @"Server\r_user",
+            ["rLibsUserPath"] = @"Server\r_user\library"
         };
 
 
@@ -447,7 +465,17 @@ public partial class MainWindow : Window
             if (File.Exists(configPath))
             {
                 string jsonContent = File.ReadAllText(configPath);
-                config = Newtonsoft.Json.JsonConvert.DeserializeObject(jsonContent) ?? config;
+                if (!string.IsNullOrWhiteSpace(jsonContent))
+                {
+                    var loaded = JsonConvert.DeserializeObject<JObject>(jsonContent);
+                    if (loaded != null)
+                    {
+                        config.Merge(loaded, new JsonMergeSettings
+                        {
+                            MergeArrayHandling = MergeArrayHandling.Replace
+                        });
+                    }
+                }
             }
             else
             {
@@ -460,19 +488,15 @@ public partial class MainWindow : Window
         }
 
         // Resolve all paths
-        string pythonPath = ResolvePath(baseDirectory, (string)config.pythonPath);
-        string rPath = ResolveRHomePath(baseDirectory, (string)config.RPath);
-        string serverPath = ResolvePath(serverDirectory,(string)config.serverPath);
-        string activateCommand = ResolvePath(baseDirectory, (string)config.activateCommand);
+        string pythonPath = ResolvePath(baseDirectory, config.Value<string>("pythonPath") ?? string.Empty);
+        string rPath = ResolveRHomePath(baseDirectory, config.Value<string>("RPath") ?? string.Empty);
+        string serverPath = ResolvePath(serverDirectory, config.Value<string>("serverPath") ?? string.Empty);
 
-        string envName = config.envName;
-
-        string documentsPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        string logPath = Path.Combine(documentsPath, "flask_log.txt");
+        string logPath = ResolvePath(baseDirectory, config.Value<string>("logPath") ?? @"Server\flask_log.txt");
         if (!File.Exists(logPath))
         {
             // Ensure the directory exists before creating the log file
-            Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? documentsPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? serverDirectory);
             File.Create(logPath).Close(); // 
         }
 
@@ -485,30 +509,56 @@ public partial class MainWindow : Window
 
 
 
-        string fullCommand = $"call \"{activateCommand}\" {envName} && \"{pythonPath}\" \"{serverPath}\"";
-        Debug.WriteLine($"Generated command: {fullCommand}");
-
         var start = new ProcessStartInfo
         {
-            FileName = "cmd.exe",
-            Arguments = "/C " + fullCommand, // Use /C instead of /K
+            FileName = pythonPath,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(serverPath)
         };
+        start.ArgumentList.Add("-u");
+        start.ArgumentList.Add(serverPath);
 
         // Set R environment variables
         start.EnvironmentVariables["R_HOME"] = rHomePath;
 
-        // Get current PATH and add R bin directory
-        string currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
-        start.EnvironmentVariables["PATH"] = currentPath + ";" + rBinPath;
+        // Build PATH with Python/Conda runtime directories first so native modules
+        // (for example _ssl.pyd -> libssl/libcrypto) can load correctly.
+        string pythonDirectory = Path.GetDirectoryName(pythonPath) ?? string.Empty;
+        string pythonDlls = Path.Combine(pythonDirectory, "DLLs");
+        string pythonScripts = Path.Combine(pythonDirectory, "Scripts");
+        string condaLibraryBin = Path.Combine(pythonDirectory, "Library", "bin");
+        string condaLibraryUsrBin = Path.Combine(pythonDirectory, "Library", "usr", "bin");
+        string condaLibraryMingwBin = Path.Combine(pythonDirectory, "Library", "mingw-w64", "bin");
+        string condaBin = Path.Combine(pythonDirectory, "bin");
+        string rBinX64Path = Path.Combine(rBinPath, "x64");
 
-        // Add additional R environment variables for better compatibility
-        start.EnvironmentVariables["R_USER"] = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        start.EnvironmentVariables["R_LIBS_USER"] = Path.Combine(rHomePath, "library");
+        var pathParts = new List<string>();
+        foreach (var candidate in new[] { condaLibraryBin, condaLibraryUsrBin, condaLibraryMingwBin, pythonDlls, pythonScripts, pythonDirectory, condaBin, rBinPath, rBinX64Path })
+        {
+            if (Directory.Exists(candidate))
+                pathParts.Add(candidate);
+        }
+
+        // Keep system PATH to avoid breaking Windows built-in tooling resolution
+        // (e.g. commands indirectly used by dependencies during startup).
+        string inheritedPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(inheritedPath))
+        {
+            pathParts.Add(inheritedPath);
+        }
+        start.EnvironmentVariables["PATH"] = string.Join(";", pathParts);
+        start.EnvironmentVariables["RPY2_CFFI_MODE"] = "ABI";
+
+        // Add additional R environment variables from config.
+        string rUserPath = ResolvePath(baseDirectory, config.Value<string>("rUserPath") ?? @"Server\r_user");
+        string rLibsUserPath = ResolvePath(baseDirectory, config.Value<string>("rLibsUserPath") ?? @"Server\r_user\library");
+        Directory.CreateDirectory(rUserPath);
+        Directory.CreateDirectory(rLibsUserPath);
+        start.EnvironmentVariables["R_USER"] = rUserPath;
+        start.EnvironmentVariables["R_LIBS_USER"] = rLibsUserPath;
 
         // Verify paths before starting
         bool pathsValid = true;
@@ -546,48 +596,74 @@ public partial class MainWindow : Window
             return;
         }
 
-        using (flaskProcess = new Process { StartInfo = start })
+        flaskProcess = new Process { StartInfo = start };
+        var runningProcess = flaskProcess;
+
+        GlobalLogWriter = new StreamWriter(logPath, append: true);
+        GlobalLogWriter.AutoFlush = true;
+
+        runningProcess.EnableRaisingEvents = true;
+        runningProcess.Exited += (s, e) =>
         {
-            GlobalLogWriter = new StreamWriter(logPath, append: true);
-            GlobalLogWriter.AutoFlush = true;
+            GlobalLogWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff}] ❌ Flask process exited unexpectedly.");
+            Debug.WriteLine("❌ Flask process exited unexpectedly.");
+        };
 
-            flaskProcess.EnableRaisingEvents = true;
-            flaskProcess.Exited += (s, e) =>
+        runningProcess.Start();
+        var earlyStdErr = new StringBuilder();
+
+        // Asynchronously log standard error
+        _ = Task.Run(async () =>
+        {
+            using var errReader = runningProcess.StandardError;
+            string? errLine;
+            while ((errLine = await errReader.ReadLineAsync()) != null)
             {
-                GlobalLogWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff}] ❌ Flask process exited unexpectedly.");
-                Debug.WriteLine("❌ Flask process exited unexpectedly.");
-            };
-
-            flaskProcess.Start();
-
-            // Asynchronously log standard error
-            _ = Task.Run(async () =>
-            {
-                using var errReader = flaskProcess.StandardError;
-                string? errLine;
-                while ((errLine = await errReader.ReadLineAsync()) != null)
+                if (earlyStdErr.Length < 4096)
                 {
-                    GlobalLogWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff}] [ERROR] {errLine}");
+                    if (earlyStdErr.Length > 0) earlyStdErr.AppendLine();
+                    earlyStdErr.Append(errLine);
                 }
-            });
+                GlobalLogWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff}] [ERROR] {errLine}");
+            }
+        });
 
-            // Read standard output and write to log
-            using var reader = flaskProcess.StandardOutput;
+        // Asynchronously log standard output
+        _ = Task.Run(async () =>
+        {
+            using var reader = runningProcess.StandardOutput;
             string? output;
             while ((output = await reader.ReadLineAsync()) != null)
             {
                 GlobalLogWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff}] [INFO] {output}");
+            }
+        });
 
-                if (output.Contains("Running on http://127.0.0.1:5001/"))
-                {
-                    Debug.WriteLine("✅ Flask started successfully.");
-                    break;
-                }
+        // Wait until the API port is actually ready before UI actions use the server.
+        bool ready = false;
+        for (int i = 0; i < 60; i++)
+        {
+            if (runningProcess.HasExited)
+            {
+                string details = earlyStdErr.Length > 0 ? $" Stderr: {earlyStdErr}" : string.Empty;
+                throw new InvalidOperationException($"Python server exited early with code {runningProcess.ExitCode}.{details}");
             }
 
-            GlobalLogWriter?.Dispose();
-            GlobalLogWriter = null;
+            if (await IsPortInUseAsync(5001))
+            {
+                ready = true;
+                break;
+            }
+
+            await Task.Delay(250);
         }
+
+        if (!ready)
+        {
+            throw new TimeoutException("Python server did not become ready on 127.0.0.1:5001 within timeout.");
+        }
+
+        Debug.WriteLine("✅ Flask started successfully and port 5001 is ready.");
     }
 
 

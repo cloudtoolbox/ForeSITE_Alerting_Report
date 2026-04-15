@@ -1,5 +1,6 @@
 ﻿using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Collections.ObjectModel;
 using System.Data;
 using System.Diagnostics;
@@ -17,9 +18,9 @@ namespace ForeSITETestApp
 
         static DBHelper()
         {
-            // Initialize database path in Python subdirectory
-            string currentDirectory = Directory.GetCurrentDirectory();
-            string pythonDirectory = Path.Combine(currentDirectory, "Server");
+            // Keep DB location stable regardless of working directory.
+            string baseDirectory = AppContext.BaseDirectory;
+            string pythonDirectory = Path.Combine(baseDirectory, "Server");
             DatabasePath = Path.Combine(pythonDirectory, "foresite_alerting.db");
             ConnectionString = $"Data Source={DatabasePath}";
             Debug.WriteLine($"Database path set to: {DatabasePath}");
@@ -54,7 +55,7 @@ namespace ForeSITETestApp
             {
                 throw new InvalidOperationException("Could not determine the Python directory from the database path.");
             }
-
+            Directory.CreateDirectory(pythonDirectory);
         }
 
 
@@ -85,14 +86,6 @@ namespace ForeSITETestApp
                     )";
                 command.ExecuteNonQuery();
                 
-                command = connection.CreateCommand();
-                command.CommandText = @"Drop table modelproperties";
-                command.ExecuteNonQuery();
-                command = connection.CreateCommand();
-                command.CommandText = @"Drop table models";
-                command.ExecuteNonQuery();
-                
-
                 command = connection.CreateCommand();
                 command.CommandText = @"
                     CREATE TABLE IF NOT EXISTS models (
@@ -147,6 +140,10 @@ namespace ForeSITETestApp
                 {
                     InsertInitialmodels();
                 }
+                else
+                {
+                    EnsureMissingInitialModels();
+                }
 
                 Console.WriteLine($"Database initialized successfully at: {DatabasePath}");
 
@@ -167,11 +164,12 @@ namespace ForeSITETestApp
         /// <returns>Number of rows inserted</returns>
         public static int InsertInitialDataSources()
         {
+            string initialCdcToken = GetInitialCdcAppToken();
             var initialDataSources = new[]
            {
-             new DataSource { Name = "COVID-19 Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken="Wa9PucgUy1cHNJgzoTZwhg9AY", IsRealtime = true },
-             new DataSource{ Name = "Pneumonia Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken="Wa9PucgUy1cHNJgzoTZwhg9AY",  IsRealtime = true },
-             new DataSource{ Name = "Flu Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = "Wa9PucgUy1cHNJgzoTZwhg9AY", IsRealtime = true },
+             new DataSource { Name = "COVID-19 Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken=initialCdcToken, IsRealtime = true },
+             new DataSource{ Name = "Pneumonia Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken=initialCdcToken,  IsRealtime = true },
+             new DataSource{ Name = "Flu Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = initialCdcToken, IsRealtime = true },
              new DataSource{ Name = "COVID-19 Tests", DataURL = "local_covid_19_test_data.csv", ResourceURL = "local", IsRealtime = false }
            };
 
@@ -188,12 +186,43 @@ namespace ForeSITETestApp
             return insertedCount;
         }
 
+        private static string GetInitialCdcAppToken()
+        {
+            try
+            {
+                string configPath = Path.Combine(AppContext.BaseDirectory, "Server", "config.json");
+                if (!File.Exists(configPath))
+                    return string.Empty;
+
+                var root = JObject.Parse(File.ReadAllText(configPath));
+                string[] keys =
+                {
+                    "FORESITE_CDC_APP_TOKEN",
+                    "foresite_cdc_app_token",
+                    "cdcAppToken",
+                    "appToken"
+                };
+
+                foreach (string key in keys)
+                {
+                    string? token = root[key]?.ToString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(token))
+                        return token;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to read CDC app token from config.json: {ex.Message}");
+            }
+
+            return string.Empty;
+        }
+
         public static int InsertInitialmodels()
         {
             try
             {
-                string currentDirectory = Directory.GetCurrentDirectory();
-                string jsonFilePath = Path.Combine(currentDirectory, "models.json");
+                string jsonFilePath = Path.Combine(AppContext.BaseDirectory, "models.json");
 
                 if (!File.Exists(jsonFilePath))
                 {
@@ -211,16 +240,18 @@ namespace ForeSITETestApp
                 }
 
                 int insertedCount = 0;
+                using var connection = new SqliteConnection(ConnectionString);
+                connection.Open();
+                using var transaction = connection.BeginTransaction();
+
                 foreach (var model in modelData.InitialModels)
                 {
                     // Insert into models table (without Properties)
                     int modelId = -1;
                     try
                     {
-                        using var connection = new SqliteConnection(ConnectionString);
-                        connection.Open();
-
                         using var command = connection.CreateCommand();
+                        command.Transaction = transaction;
                         command.CommandText = @"
                     INSERT INTO models (Name, FullName, Description, Type, Enabled, CreatedDate, LastUpdated)
                     VALUES ($modelName, $fullModelName, $description, $type, $enabled, $createdDate, $lastUpdated);
@@ -253,10 +284,8 @@ namespace ForeSITETestApp
                             {
                                 try
                                 {
-                                    using var connection = new SqliteConnection(ConnectionString);
-                                    connection.Open();
-
                                     using var command = connection.CreateCommand();
+                                    command.Transaction = transaction;
                                     command.CommandText = @"
                                 INSERT INTO modelproperties (ModelId, Name, Type, DefaultValue,  Title)
                                 VALUES ($modelId, $name, $type, $defaultValue,  $title)";
@@ -277,12 +306,114 @@ namespace ForeSITETestApp
                     }
                 }
 
+                transaction.Commit();
                 Console.WriteLine($"Inserted {insertedCount} initial models from JSON file");
                 return insertedCount;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error inserting initial models: {ex.Message}");
+                return 0;
+            }
+        }
+
+        private static int EnsureMissingInitialModels()
+        {
+            try
+            {
+                string jsonFilePath = Path.Combine(AppContext.BaseDirectory, "models.json");
+                if (!File.Exists(jsonFilePath))
+                {
+                    return 0;
+                }
+
+                string jsonContent = File.ReadAllText(jsonFilePath);
+                var modelData = JsonConvert.DeserializeObject<InitialModelsData>(jsonContent);
+                if (modelData?.InitialModels == null || !modelData.InitialModels.Any())
+                {
+                    return 0;
+                }
+
+                int insertedCount = 0;
+                using var connection = new SqliteConnection(ConnectionString);
+                connection.Open();
+                using var transaction = connection.BeginTransaction();
+
+                foreach (var model in modelData.InitialModels)
+                {
+                    if (model == null || string.IsNullOrWhiteSpace(model.Name))
+                        continue;
+
+                    int modelId;
+                    using (var existingCmd = connection.CreateCommand())
+                    {
+                        existingCmd.Transaction = transaction;
+                        existingCmd.CommandText = "SELECT Id FROM models WHERE Name = $name";
+                        existingCmd.Parameters.AddWithValue("$name", model.Name.Trim());
+                        var existing = existingCmd.ExecuteScalar();
+                        if (existing == null || existing == DBNull.Value)
+                        {
+                            using var insertCmd = connection.CreateCommand();
+                            insertCmd.Transaction = transaction;
+                            insertCmd.CommandText = @"
+                                INSERT INTO models (Name, FullName, Description, Type, Enabled, CreatedDate, LastUpdated)
+                                VALUES ($modelName, $fullModelName, $description, $type, $enabled, $createdDate, $lastUpdated);
+                                SELECT last_insert_rowid();";
+                            insertCmd.Parameters.AddWithValue("$modelName", model.Name ?? "");
+                            insertCmd.Parameters.AddWithValue("$fullModelName", model.FullName ?? "");
+                            insertCmd.Parameters.AddWithValue("$description", model.Description ?? "");
+                            insertCmd.Parameters.AddWithValue("$type", model.Type ?? "");
+                            insertCmd.Parameters.AddWithValue("$enabled", model.Enabled ? 1 : 0);
+                            insertCmd.Parameters.AddWithValue("$createdDate", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                            insertCmd.Parameters.AddWithValue("$lastUpdated", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                            modelId = Convert.ToInt32(insertCmd.ExecuteScalar());
+                            insertedCount++;
+                        }
+                        else
+                        {
+                            modelId = Convert.ToInt32(existing);
+                        }
+                    }
+
+                    if (modelId <= 0 || model.Properties == null)
+                        continue;
+
+                    foreach (var prop in model.Properties)
+                    {
+                        if (prop == null || string.IsNullOrWhiteSpace(prop.Name))
+                            continue;
+
+                        using var propCheck = connection.CreateCommand();
+                        propCheck.Transaction = transaction;
+                        propCheck.CommandText = @"
+                            SELECT 1 FROM modelproperties
+                            WHERE modelId = $modelId AND Name = $name";
+                        propCheck.Parameters.AddWithValue("$modelId", modelId);
+                        propCheck.Parameters.AddWithValue("$name", prop.Name ?? "");
+                        var propExists = propCheck.ExecuteScalar();
+                        if (propExists != null && propExists != DBNull.Value)
+                            continue;
+
+                        using var propInsert = connection.CreateCommand();
+                        propInsert.Transaction = transaction;
+                        propInsert.CommandText = @"
+                            INSERT INTO modelproperties (ModelId, Name, Type, DefaultValue, Title)
+                            VALUES ($modelId, $name, $type, $defaultValue, $title)";
+                        propInsert.Parameters.AddWithValue("$modelId", modelId);
+                        propInsert.Parameters.AddWithValue("$name", prop.Name ?? "");
+                        propInsert.Parameters.AddWithValue("$type", prop.Type ?? "");
+                        propInsert.Parameters.AddWithValue("$defaultValue", prop.DefaultValue ?? "");
+                        propInsert.Parameters.AddWithValue("$title", prop.Title ?? "");
+                        propInsert.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+                return insertedCount;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error ensuring missing initial models: {ex.Message}");
                 return 0;
             }
         }
@@ -1206,4 +1337,5 @@ namespace ForeSITETestApp
     }
 
 }
+
 

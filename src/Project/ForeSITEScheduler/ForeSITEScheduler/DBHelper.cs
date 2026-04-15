@@ -1,6 +1,7 @@
-﻿using ForeSITEScheduler;
+using ForeSITEScheduler;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Collections.ObjectModel;
 using System.Data;
 using System.IO;
@@ -38,7 +39,7 @@ namespace SchedulerRunner
             {
                 throw new InvalidOperationException("Could not determine the Python directory from the database path.");
             }
-
+            Directory.CreateDirectory(pythonDirectory);
         }
 
 
@@ -57,9 +58,9 @@ namespace SchedulerRunner
 
                 using (var cmd = connection.CreateCommand())
                 {
-                    cmd.CommandText = @"PRAGMA journal_mode=WAL;      
-                                        PRAGMA synchronous=NORMAL;     
-                                        PRAGMA busy_timeout=5000;"; //--5 seconds
+                    cmd.CommandText = @"PRAGMA journal_mode=WAL;      -- ??????,???
+                                        PRAGMA synchronous=NORMAL;     -- ??/?????
+                                        PRAGMA busy_timeout=5000;"; //--5 ?????
                     cmd.ExecuteNonQuery();
                 }
 
@@ -121,7 +122,6 @@ namespace SchedulerRunner
                     Title TEXT,
                     Type TEXT,
                     DefaultValue TEXT,
-                    DisplayInUI INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (modelId) REFERENCES models(Id) ON DELETE CASCADE
                 )";
                     command.ExecuteNonQuery();
@@ -137,6 +137,10 @@ namespace SchedulerRunner
                 if (GetmodelsCount() == 0)
                 {
                     InsertInitialmodels();
+                }
+                else
+                {
+                    EnsureMissingInitialModels();
                 }
 
                 Console.WriteLine($"Database initialized successfully at: {DatabasePath}");
@@ -158,11 +162,12 @@ namespace SchedulerRunner
         /// <returns>Number of rows inserted</returns>
         public static int InsertInitialDataSources()
         {
-            var initialDataSources = new[]
+            string initialCdcToken = GetInitialCdcAppToken();
+           var initialDataSources = new[]
            {
-             new DataSource { Name = "COVID-19 Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken="Wa9PucgUy1cHNJgzoTZwhg9AY", IsRealtime = true },
-             new DataSource{ Name = "Pneumonia Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken="Wa9PucgUy1cHNJgzoTZwhg9AY",  IsRealtime = true },
-             new DataSource{ Name = "Flu Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = "Wa9PucgUy1cHNJgzoTZwhg9AY", IsRealtime = true },
+             new DataSource { Name = "COVID-19 Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = initialCdcToken, IsRealtime = true },
+             new DataSource{ Name = "Pneumonia Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = initialCdcToken,  IsRealtime = true },
+             new DataSource{ Name = "Flu Deaths", DataURL = "https://data.cdc.gov", ResourceURL = "r8kw-7aab", AppToken = initialCdcToken, IsRealtime = true },
              new DataSource{ Name = "COVID-19 Tests", DataURL = "local_covid_19_test_data.csv", ResourceURL = "local", IsRealtime = false }
            };
 
@@ -179,16 +184,56 @@ namespace SchedulerRunner
             return insertedCount;
         }
 
+        private static string GetInitialCdcAppToken()
+        {
+            try
+            {
+                string configPath = Path.Combine(AppContext.BaseDirectory, "Server", "config.json");
+                if (!File.Exists(configPath))
+                    return string.Empty;
+                var root = JObject.Parse(File.ReadAllText(configPath));
+                string[] keys =
+                {
+                    "FORESITE_CDC_APP_TOKEN",
+                    "foresite_cdc_app_token",
+                    "cdcAppToken",
+                    "appToken"
+                };
+                foreach (string key in keys)
+                {
+                    string? token = root[key]?.ToString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(token))
+                        return token;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to read CDC app token from config.json: {ex.Message}");
+            }
+            return string.Empty;
+        }
+        private static string? ResolveInitialModelsPath()
+        {
+            string baseDir = AppContext.BaseDirectory;
+            string[] candidates =
+            {
+                Path.Combine(baseDir, "models.json"),
+                Path.Combine(baseDir, "initial_models.json"),
+                Path.Combine(Directory.GetCurrentDirectory(), "models.json"),
+                Path.Combine(Directory.GetCurrentDirectory(), "initial_models.json")
+            };
+            return candidates.FirstOrDefault(File.Exists);
+        }
+
         public static int InsertInitialmodels()
         {
             try
             {
-                string currentDirectory = Directory.GetCurrentDirectory();
-                string jsonFilePath = Path.Combine(currentDirectory, "initial_models.json");
+                string? jsonFilePath = ResolveInitialModelsPath();
 
-                if (!File.Exists(jsonFilePath))
+                if (string.IsNullOrWhiteSpace(jsonFilePath))
                 {
-                    Console.WriteLine($"Initial models file not found at: {jsonFilePath}");
+                    Console.WriteLine("Initial models file not found. Expected models.json or initial_models.json.");
                     return 0;
                 }
 
@@ -249,13 +294,12 @@ namespace SchedulerRunner
 
                                     using var command = connection.CreateCommand();
                                     command.CommandText = @"
-                                INSERT INTO modelproperties (ModelId, Name, Type, DefaultValue, DisplayInUI, Title)
-                                VALUES ($modelId, $name, $type, $defaultValue, $displayInUI, $title)";
+                                INSERT INTO modelproperties (ModelId, Name, Type, DefaultValue, Title)
+                                VALUES ($modelId, $name, $type, $defaultValue, $title)";
                                     command.Parameters.AddWithValue("$modelId", modelId);
                                     command.Parameters.AddWithValue("$name", prop.Name ?? "");
                                     command.Parameters.AddWithValue("$type", prop.Type ?? "");
                                     command.Parameters.AddWithValue("$defaultValue", prop.DefaultValue ?? "");
-                                    command.Parameters.AddWithValue("$displayInUI", prop.DisplayInUI ? 1 : 0);
                                     command.Parameters.AddWithValue("$title", prop.Title ?? "");
                                     command.ExecuteNonQuery();
                                 }
@@ -277,6 +321,103 @@ namespace SchedulerRunner
                 return 0;
             }
         }
+        private static int EnsureMissingInitialModels()
+        {
+            try
+            {
+                string? jsonFilePath = ResolveInitialModelsPath();
+                if (string.IsNullOrWhiteSpace(jsonFilePath))
+                    return 0;
+
+                string jsonContent = File.ReadAllText(jsonFilePath);
+                var modelData = JsonConvert.DeserializeObject<InitialModelsData>(jsonContent);
+                if (modelData?.InitialModels == null || !modelData.InitialModels.Any())
+                    return 0;
+
+                int insertedCount = 0;
+                using var connection = new SqliteConnection(ConnectionString);
+                connection.Open();
+                using var transaction = connection.BeginTransaction();
+
+                foreach (var model in modelData.InitialModels)
+                {
+                    if (model == null || string.IsNullOrWhiteSpace(model.Name))
+                        continue;
+
+                    int modelId;
+                    using (var existingCmd = connection.CreateCommand())
+                    {
+                        existingCmd.Transaction = transaction;
+                        existingCmd.CommandText = "SELECT Id FROM models WHERE Name = $name";
+                        existingCmd.Parameters.AddWithValue("$name", model.Name.Trim());
+                        var existing = existingCmd.ExecuteScalar();
+                        if (existing == null || existing == DBNull.Value)
+                        {
+                            using var insertCmd = connection.CreateCommand();
+                            insertCmd.Transaction = transaction;
+                            insertCmd.CommandText = @"
+                                INSERT INTO models (Name, FullName, Description, Type, Enabled, CreatedDate, LastUpdated)
+                                VALUES ($modelName, $fullModelName, $description, $type, $enabled, $createdDate, $lastUpdated);
+                                SELECT last_insert_rowid();";
+                            insertCmd.Parameters.AddWithValue("$modelName", model.Name ?? "");
+                            insertCmd.Parameters.AddWithValue("$fullModelName", model.FullName ?? "");
+                            insertCmd.Parameters.AddWithValue("$description", model.Description ?? "");
+                            insertCmd.Parameters.AddWithValue("$type", model.Type ?? "");
+                            insertCmd.Parameters.AddWithValue("$enabled", model.Enabled ? 1 : 0);
+                            insertCmd.Parameters.AddWithValue("$createdDate", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                            insertCmd.Parameters.AddWithValue("$lastUpdated", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                            modelId = Convert.ToInt32(insertCmd.ExecuteScalar());
+                            insertedCount++;
+                        }
+                        else
+                        {
+                            modelId = Convert.ToInt32(existing);
+                        }
+                    }
+
+                    if (modelId <= 0 || model.Properties == null)
+                        continue;
+
+                    foreach (var prop in model.Properties)
+                    {
+                        if (prop == null || string.IsNullOrWhiteSpace(prop.Name))
+                            continue;
+
+                        using var propCheck = connection.CreateCommand();
+                        propCheck.Transaction = transaction;
+                        propCheck.CommandText = @"
+                            SELECT 1 FROM modelproperties
+                            WHERE modelId = $modelId AND Name = $name";
+                        propCheck.Parameters.AddWithValue("$modelId", modelId);
+                        propCheck.Parameters.AddWithValue("$name", prop.Name ?? "");
+                        var propExists = propCheck.ExecuteScalar();
+                        if (propExists != null && propExists != DBNull.Value)
+                            continue;
+
+                        using var propInsert = connection.CreateCommand();
+                        propInsert.Transaction = transaction;
+                        propInsert.CommandText = @"
+                            INSERT INTO modelproperties (ModelId, Name, Type, DefaultValue, Title)
+                            VALUES ($modelId, $name, $type, $defaultValue, $title)";
+                        propInsert.Parameters.AddWithValue("$modelId", modelId);
+                        propInsert.Parameters.AddWithValue("$name", prop.Name ?? "");
+                        propInsert.Parameters.AddWithValue("$type", prop.Type ?? "");
+                        propInsert.Parameters.AddWithValue("$defaultValue", prop.DefaultValue ?? "");
+                        propInsert.Parameters.AddWithValue("$title", prop.Title ?? "");
+                        propInsert.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+                return insertedCount;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error ensuring missing initial models: {ex.Message}");
+                return 0;
+            }
+        }
+
         /// <summary>
         /// Insert a new model into the database
         /// </summary>
@@ -499,7 +640,7 @@ namespace SchedulerRunner
                 // 2. Read all modelproperties and assign to corresponding models
                 using var propCommand = connection.CreateCommand();
                 propCommand.CommandText = @"
-                    SELECT Id, modelId, Name, Title, Type, DefaultValue, DisplayInUI
+                    SELECT Id, modelId, Name, Title, Type, DefaultValue
                     FROM modelproperties";
                 using var propReader = propCommand.ExecuteReader();
                 while (propReader.Read())
@@ -512,9 +653,7 @@ namespace SchedulerRunner
                             Name = propReader["Name"]?.ToString() ?? "",
                             Title = propReader["Title"]?.ToString() ?? "",
                             Type = propReader["Type"]?.ToString() ?? "",
-                            DefaultValue = propReader["DefaultValue"]?.ToString() ?? "",
-                            DisplayInUI = Convert.ToInt32(propReader["DisplayInUI"]) == 1
-                        };
+                            DefaultValue = propReader["DefaultValue"]?.ToString() ?? "",                        };
                         model.Properties.Add(prop);
                     }
                 }
@@ -811,13 +950,11 @@ namespace SchedulerRunner
                                 UPDATE modelproperties
                                 SET Title = $title,
                                     Type = $type,
-                                    DefaultValue = $defaultValue,
-                                    DisplayInUI = $displayInUI
+                                    DefaultValue = $defaultValue
                                 WHERE Id = $id";
                             updateCmd.Parameters.AddWithValue("$title", prop.Title ?? "");
                             updateCmd.Parameters.AddWithValue("$type", prop.Type ?? "");
                             updateCmd.Parameters.AddWithValue("$defaultValue", prop.DefaultValue ?? "");
-                            updateCmd.Parameters.AddWithValue("$displayInUI", prop.DisplayInUI ? 1 : 0);
                             updateCmd.Parameters.AddWithValue("$id", propertyId);
 
                             updateCmd.ExecuteNonQuery();
@@ -827,14 +964,13 @@ namespace SchedulerRunner
                             // Insert new property
                             using var insertCmd = connection.CreateCommand();
                             insertCmd.CommandText = @"
-                                INSERT INTO modelproperties (modelId, Name, Title, Type, DefaultValue, DisplayInUI)
-                                VALUES ($modelId, $name, $title, $type, $defaultValue, $displayInUI)";
+                                INSERT INTO modelproperties (modelId, Name, Title, Type, DefaultValue)
+                                VALUES ($modelId, $name, $title, $type, $defaultValue)";
                             insertCmd.Parameters.AddWithValue("$modelId", modelId);
                             insertCmd.Parameters.AddWithValue("$name", prop.Name ?? "");
                             insertCmd.Parameters.AddWithValue("$title", prop.Title ?? "");
                             insertCmd.Parameters.AddWithValue("$type", prop.Type ?? "");
                             insertCmd.Parameters.AddWithValue("$defaultValue", prop.DefaultValue ?? "");
-                            insertCmd.Parameters.AddWithValue("$displayInUI", prop.DisplayInUI ? 1 : 0);
 
                             insertCmd.ExecuteNonQuery();
                         }
@@ -958,7 +1094,7 @@ namespace SchedulerRunner
                 using (var propCommand = connection.CreateCommand())
                 {
                     propCommand.CommandText = @"
-                        SELECT Name, Title, Type, DefaultValue, DisplayInUI
+                        SELECT Name, Title, Type, DefaultValue
                         FROM modelproperties
                         WHERE modelId = $modelId";
                     propCommand.Parameters.AddWithValue("$modelId", modelId);
@@ -971,9 +1107,7 @@ namespace SchedulerRunner
                             Name = propReader["Name"]?.ToString() ?? "",
                             Title = propReader["Title"]?.ToString() ?? "",
                             Type = propReader["Type"]?.ToString() ?? "",
-                            DefaultValue = propReader["DefaultValue"]?.ToString() ?? "",
-                            DisplayInUI = Convert.ToInt32(propReader["DisplayInUI"]) == 1
-                        };
+                            DefaultValue = propReader["DefaultValue"]?.ToString() ?? "",                        };
                         model.Properties.Add(prop);
                     }
                 }
@@ -1079,7 +1213,7 @@ namespace SchedulerRunner
 
                 using var command = connection.CreateCommand();
                 command.CommandText = @"
-                SELECT Id, modelId, Name, Type, DefaultValue, DisplayInUI, Title
+                SELECT Id, modelId, Name, Type, DefaultValue, Title
                 FROM modelproperties
                 WHERE modelId = $modelId";
                 command.Parameters.AddWithValue("$modelId", modelId);
@@ -1091,9 +1225,7 @@ namespace SchedulerRunner
                     {
                         Name = reader["Name"]?.ToString() ?? "",
                         Type = reader["Type"]?.ToString() ?? "",
-                        DefaultValue = reader["DefaultValue"]?.ToString() ?? "",
-                        DisplayInUI = Convert.ToInt32(reader["DisplayInUI"]) == 1,
-                        Title = reader["Title"]?.ToString() ?? ""
+                        DefaultValue = reader["DefaultValue"]?.ToString() ?? "",                        Title = reader["Title"]?.ToString() ?? ""
                     });
                 }
             }
@@ -1116,13 +1248,12 @@ namespace SchedulerRunner
 
                 using var command = connection.CreateCommand();
                 command.CommandText = @"
-                INSERT INTO modelproperties (modelId, Name, Type, DefaultValue, DisplayInUI, Title)
-                VALUES ($modelId, $name, $type, $defaultValue, $displayInUI, $title)";
+                INSERT INTO modelproperties (modelId, Name, Type, DefaultValue, Title)
+                VALUES ($modelId, $name, $type, $defaultValue, $title)";
                 command.Parameters.AddWithValue("$modelId", modelId);
                 command.Parameters.AddWithValue("$name", property.Name ?? "");
                 command.Parameters.AddWithValue("$type", property.Type ?? "");
                 command.Parameters.AddWithValue("$defaultValue", property.DefaultValue ?? "");
-                command.Parameters.AddWithValue("$displayInUI", property.DisplayInUI ? 1 : 0);
                 command.Parameters.AddWithValue("$title", property.Title ?? "");
 
                 command.ExecuteNonQuery();
@@ -1151,13 +1282,11 @@ namespace SchedulerRunner
                 SET Name = $name,
                     Type = $type,
                     DefaultValue = $defaultValue,
-                    DisplayInUI = $displayInUI,
                     Title = $title
                 WHERE Id = $id";
                 command.Parameters.AddWithValue("$name", property.Name ?? "");
                 command.Parameters.AddWithValue("$type", property.Type ?? "");
                 command.Parameters.AddWithValue("$defaultValue", property.DefaultValue ?? "");
-                command.Parameters.AddWithValue("$displayInUI", property.DisplayInUI ? 1 : 0);
                 command.Parameters.AddWithValue("$title", property.Title ?? "");
                 command.Parameters.AddWithValue("$id", propertyId);
 
@@ -1199,4 +1328,5 @@ namespace SchedulerRunner
     }
 
 }
+
 

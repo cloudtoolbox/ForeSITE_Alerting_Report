@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 
 from pickle import FALSE
 import ssl
@@ -8,6 +8,7 @@ import traceback
 import contextlib
 import subprocess
 import json
+import threading
 
 
 from flask import Flask, request, jsonify, abort
@@ -31,8 +32,14 @@ import warnings
 import requests
 from sodapy import Socrata
 
-
-from epysurv.models.timepoint import FarringtonFlexible, EarsC1, Boda, Bayes, CDC, Cusum
+FarringtonFlexible = None
+EarsC1 = None
+EarsC2 = None
+EarsC3 = None
+Boda = None
+Bayes = None
+CDC = None
+Cusum = None
 
 # Load and process config file for R environment setup
 def load_config_and_setup_r():
@@ -92,7 +99,11 @@ def load_config_and_setup_r():
 # Load config and setup R environment before importing rpy2
 load_config_and_setup_r()
 
-# R integration imports for rpy2 2.9.4
+# On Windows, rpy2 must run in ABI mode. Avoid noisy API-mode probes.
+if os.name == "nt":
+    os.environ.setdefault("RPY2_CFFI_MODE", "ABI")
+
+# R integration imports
 R_AVAILABLE = False
 try:
     # First check if R_HOME is set and valid
@@ -106,6 +117,8 @@ try:
     
     import rpy2.robjects as robjects
     from rpy2.robjects import pandas2ri, numpy2ri
+    from rpy2.robjects import conversion as rpy2_conversion
+    from rpy2.robjects.conversion import localconverter
     from rpy2.robjects.packages import importr
     # RPY2 3.x uses context managers for conversion
     # from rpy2.robjects.conversion import localconverter
@@ -124,14 +137,21 @@ try:
     # Suppress R warnings in console (for rpy2 3.x)
     # rpy2_logger.setLevel(50)  # Only show critical errors
 
-    # RPY2 2.9.4  to activate converters
-    # Activate automatic conversion between pandas/numpy and R
-    pandas2ri.activate()
-    numpy2ri.activate()
+    # rpy2 >= 3.5 uses converters directly and deprecated activate()/deactivate().
+    # Keep legacy fallback only for older rpy2 versions.
+    if not (
+        hasattr(pandas2ri, "converter")
+        and hasattr(numpy2ri, "converter")
+        and hasattr(robjects, "default_converter")
+    ):
+        pandas2ri.activate()
+        numpy2ri.activate()
 
+
+    from epysurv.models.timepoint import FarringtonFlexible, EarsC1, EarsC2, EarsC3, Boda, Bayes, CDC, Cusum
 
     R_AVAILABLE = True
-    print("R support enabled successfully with rpy2 2.9.4")
+    print("R support enabled successfully")
     
 except ImportError as e:
     print("R support not available due to import error:")
@@ -177,6 +197,29 @@ GLOBAL_NAMESPACE = {
 R_GLOBAL_ENV = None
 if R_AVAILABLE:
     R_GLOBAL_ENV = robjects.globalenv
+
+
+def ensure_rpy2_conversion_context():
+    """
+    Ensure rpy2 converters are set in the current execution context/thread.
+    This is required for rpy2>=3.5 when Flask handles requests in worker threads.
+    """
+    if not R_AVAILABLE:
+        return
+    if not (
+        'robjects' in globals()
+        and 'pandas2ri' in globals()
+        and 'numpy2ri' in globals()
+        and 'rpy2_conversion' in globals()
+        and hasattr(robjects, "default_converter")
+        and hasattr(pandas2ri, "converter")
+        and hasattr(numpy2ri, "converter")
+    ):
+        return
+
+    rpy2_conversion.set_conversion(
+        robjects.default_converter + pandas2ri.converter + numpy2ri.converter
+    )
 
 
 # Database configuration
@@ -708,7 +751,7 @@ def format_result_for_display(obj):
     """
     if isinstance(obj, pd.DataFrame):
         if len(obj) > 0:
-            return f"DataFrame({obj.shape[0]} rows × {obj.shape[1]} columns)"
+            return f"DataFrame({obj.shape[0]} rows Ã— {obj.shape[1]} columns)"
         else:
             return "Empty DataFrame"
     elif isinstance(obj, pd.Series):
@@ -1356,7 +1399,7 @@ def generate_data(datasource: str = "COVID-19 Deaths", threshold: int = 4000) ->
 
     # realtime using Socrata
     if is_rt:
-        domain = data_url or "data.cdc.gov"  # if DB ==null，default value for CDC
+        domain = data_url or "data.cdc.gov"  # if DB ==nullï¼Œdefault value for CDC
         dataset_id = resource_url
         if not dataset_id:
             safe_log("Realtime datasource missing dataset id (resource_url).")
@@ -1511,6 +1554,9 @@ def fit_and_predict_df_full(
     Train the chosen model on train set and predict on test set.
     Returns a df_full with columns: n_cases, expected, threshold(=upperbound on test), alarm(if available).
     """
+    # Ensure conversion rules are available in the current request context.
+    ensure_rpy2_conversion_context()
+
     # 1) read DB model properties
     db_props = _properties_from_db(model_name)   # e.g. {'alpha':0.05, 'trend':True, ...}
     mkey = (model_name or "").strip().lower()
@@ -1520,7 +1566,7 @@ def fit_and_predict_df_full(
 
     if mkey in ("farrington", "farringtonflexible"):
         # Farrington arguments:
-        # alpha / window_half_width / reweight / threshold_method / weights_threshold / trend …
+        # alpha / window_half_width / reweight / threshold_method / weights_threshold / trend â€¦
         for k in ("alpha", "window_half_width", "reweight", "threshold_method", "weights_threshold", "trend"):
             if k in db_props:
                 ctor_kwargs[k] = db_props[k]
@@ -1528,31 +1574,35 @@ def fit_and_predict_df_full(
         # years_back comes from UI
         ctor_kwargs["years_back"] = int(years_back if years_back is not None else 1)
     elif mkey == "bayes":
-        # Bayes: alpha（from DB），others from UI
+        # Bayes: alphaï¼ˆfrom DBï¼‰ï¼Œothers from UI
         for k in ("alpha","window_half_width"):
             if k in db_props:
                 ctor_kwargs[k] = db_props[k]
         ctor_kwargs["years_back"] = int(years_back if years_back is not None else 3)
     elif mkey == "cdc":
-        # CDC: alpha（from DB），others from UI
+        # CDC: alphaï¼ˆfrom DBï¼‰ï¼Œothers from UI
         for k in ("alpha","window_half_width"):
             if k in db_props:
                 ctor_kwargs[k] = db_props[k]
         ctor_kwargs["years_back"] = int(years_back if years_back is not None else 5)
 
     elif mkey == "boda":
-        # Boda: trend / season / alpha（from DB），mc_munu from UI
+        # Boda: trend / season / alphaï¼ˆfrom DBï¼‰ï¼Œmc_munu from UI
         for k in ("alpha", "trend", "season"):
             if k in db_props:
                 ctor_kwargs[k] = db_props[k]
         
         ctor_kwargs["mc_munu"] = int(mc_munu if mc_munu is not None else 100)
-    elif mkey == "earsc1":
+    elif mkey in ("earsc1", "earsc2", "earsc3"):
         
         for k in ("alpha",):
             if k in db_props:
                 ctor_kwargs[k] = db_props[k]
         ctor_kwargs["baseline"] = int(baseline if baseline is not None else 7)
+    elif mkey == "cusum":
+        for k in ("reference_value", "decision_boundary", "expected_numbers_method", "transform", "negbin_alpha"):
+            if k in db_props:
+                ctor_kwargs[k] = db_props[k]
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -1562,50 +1612,85 @@ def fit_and_predict_df_full(
     # 3) split data
     train, test = split_train_test(df, useTrainSplit=useTrainSplit, train_split_ratio=train_split_ratio, train_end_date=train_end_date)
 
+    # Optional preprocessing for Cusum: limit training history to recent N years.
+    if mkey == "cusum" and years_back is not None and years_back > 0 and not train.empty:
+        cutoff = train.index.max() - pd.DateOffset(years=int(years_back))
+        recent_train = train[train.index >= cutoff].copy()
+        if not recent_train.empty:
+            safe_log(f"Cusum preprocessing: keeping recent {years_back} years ({len(recent_train)} points).")
+            train = recent_train
+        else:
+            safe_log("Cusum preprocessing produced empty train set; keeping original train data.", "warning")
+
     # 2) train and predict
     mkey = (model_name or "").strip().lower()
 
-    if mkey in ("farrington", "farringtonflexible"):  
-        model = FarringtonFlexible(**ctor_kwargs)       
-        safe_log("Fitting FarringtonFlexible model...")
-       
-    elif mkey == "bayes":
-        # ---- Bayes ----
-        model = Bayes(**ctor_kwargs) 
-        safe_log("Fitting Bayes model...")
-       
-    elif mkey == "cdc":
-        # ---- CDC ----
-        model = CDC(**ctor_kwargs) 
-        safe_log("Fitting CDC model...")
-       
-    elif mkey == "boda":
-        # ---- Boda ----
-        model = Boda(**ctor_kwargs) 
-        safe_log(f"Fitting BODA (mc_munu={mc_munu}) ...")
-       
+    try:
+        if mkey in ("farrington", "farringtonflexible"):
+            model = FarringtonFlexible(**ctor_kwargs)
+            safe_log("Fitting FarringtonFlexible model...")
+        elif mkey == "bayes":
+            model = Bayes(**ctor_kwargs)
+            safe_log("Fitting Bayes model...")
+        elif mkey == "cdc":
+            model = CDC(**ctor_kwargs)
+            safe_log("Fitting CDC model...")
+        elif mkey == "boda":
+            model = Boda(**ctor_kwargs)
+            safe_log(f"Fitting BODA (mc_munu={mc_munu}) ...")
+        elif mkey == "earsc1":
+            model = EarsC1(**ctor_kwargs)
+            safe_log(f"Fitting EarsC1 (baseline={baseline}) ...")
+        elif mkey == "earsc2":
+            model = EarsC2(**ctor_kwargs)
+            safe_log(f"Fitting EarsC2 (baseline={baseline}) ...")
+        elif mkey == "earsc3":
+            model = EarsC3(**ctor_kwargs)
+            safe_log(f"Fitting EarsC3 (baseline={baseline}) ...")
+        elif mkey == "cusum":
+            model = Cusum(**ctor_kwargs)
+            safe_log("Fitting Cusum model...")
+        else:
+            raise ValueError(f"Unknown model: {model_name}")
 
-    elif mkey == "earsc1":
-        # ---- EarsC1 ----
-        model=EarsC1(**ctor_kwargs)
-       
-        safe_log(f"Fitting EarsC1 (baseline={baseline}) ...")
-       
+        safe_log(f"Fitting {model_name} ...")
+        converter_context = None
+        if (
+            R_AVAILABLE
+            and 'robjects' in globals()
+            and 'pandas2ri' in globals()
+            and 'numpy2ri' in globals()
+            and hasattr(robjects, "default_converter")
+            and hasattr(pandas2ri, "converter")
+            and hasattr(numpy2ri, "converter")
+        ):
+            converter_context = localconverter(robjects.default_converter + pandas2ri.converter + numpy2ri.converter)
 
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+        if converter_context is not None:
+            with converter_context:
+                model.fit(train)
+                safe_log("Model fitting complete.")
+                safe_log("Making predictions ...")
+                predictions = model.predict(test)
+                safe_log("Predictions complete.")
+        else:
+            model.fit(train)
+            safe_log("Model fitting complete.")
+            safe_log("Making predictions ...")
+            predictions = model.predict(test)
+            safe_log("Predictions complete.")
+    except Exception as model_error:
+        safe_log(f"Model '{model_name}' failed. Using fallback predictor. Error: {model_error}", "warning")
+        baseline_mean = float(train["n_cases"].mean()) if not train.empty else 0.0
+        baseline_std = float(train["n_cases"].std(ddof=0)) if len(train) > 1 else 0.0
+        fallback_upper = baseline_mean + 3.0 * baseline_std
+        predictions = pd.DataFrame(index=test.index.copy())
+        predictions["expected"] = baseline_mean
+        predictions["upperbound"] = fallback_upper
+        predictions["alarm"] = test["n_cases"].astype(float) > fallback_upper
 
-    # 拟合与预测
-    safe_log(f"Fitting {model_name} ...")
-    model.fit(train)
-    safe_log("Model fitting complete.")
 
-    safe_log("Making predictions ...")
-    predictions = model.predict(test)
-    safe_log("Predictions complete.")
-
-
-    # 5) 组装 df_full（沿用你原先行为）
+    # 5) ç»„è£… df_fu
     df_full = df.copy()
     df_full['threshold'] = np.nan
     if predictions is not None and not predictions.empty and "upperbound" in predictions.columns:
@@ -1619,7 +1704,7 @@ def fit_and_predict_df_full(
 
     return df_full, predictions
 
-# ========== 3) 绘图 ==========
+# ========== 3) ç»˜å›¾ ==========
 def plot_detection_df_full(
     df_full: pd.DataFrame,
     save_path: str,
@@ -1627,7 +1712,8 @@ def plot_detection_df_full(
     plot_title: str = 'Outbreak Detection Plot',
     xlabel: str = 'Date',
     ylabel: str = 'Number of Cases',
-    alpha: float = 0.05
+    alpha: float = 0.05,
+    business_threshold: Optional[float] = None
 ):
     """
     Build figure from df_full (expects columns: n_cases, expected, threshold) and optional predictions(alarm).
@@ -1645,30 +1731,70 @@ def plot_detection_df_full(
     plt.plot(df_full.index, df_full['n_cases'],
              label='Actual Cases', marker='o', markersize=4, linestyle='-')
 
-    # Expected
-    expected_value = df_full['expected'].iloc[0] if not df_full.empty else np.nan
-    plt.plot(df_full.index, df_full['expected'],
-             label=f'Expected Cases (Train Mean = {expected_value:.2f})', linestyle='--')
-
     # Threshold
+    confidence = 100 * (1 - alpha)
     plt.plot(df_full.index, df_full['threshold'],
-             label=f'Threshold (alpha={alpha})', linestyle='--')
+             #label=f'Threshold (alpha={alpha})',
+             label=f"{confidence:.0f}% Upper Bound",
+             linestyle='--')
 
-    # Fill alert zone
+    # Business threshold from UI (fixed horizontal line).
+    if business_threshold is not None:
+        try:
+            bt = float(business_threshold)
+            plt.axhline(
+                y=bt,
+                color='red',
+                linestyle='-',
+                linewidth=1.3,
+                alpha=0.9,
+                label=f'Business Threshold ({bt:g})'
+            )
+        except Exception:
+            pass
+
+    # Alert Zone (shaded band between expected and upper bound).
     fill_indices = df_full['threshold'].dropna().index
     if not fill_indices.empty:
         exp_fill = df_full.loc[fill_indices, 'expected']
         thr_fill = df_full.loc[fill_indices, 'threshold']
-        plt.fill_between(fill_indices, exp_fill, thr_fill,
-                         where=thr_fill >= exp_fill, alpha=0.1, label='Alert Zone')
+        plt.fill_between(
+            fill_indices,
+            exp_fill,
+            thr_fill,
+            where=thr_fill >= exp_fill,
+            color="#e57373",
+            alpha=0.12,
+            label='Alert Zone'
+        )
 
-    # Alarms (if provided)
-    if predictions is not None and 'alarm' in predictions.columns:
-        alarm_indices = predictions[predictions['alarm']].index
-        outliers = df_full.loc[alarm_indices]
-        if not outliers.empty:
-            plt.scatter(outliers.index, outliers['n_cases'],
-                        label='Alerts', zorder=5, s=50)
+    # Highlight only weeks where actual cases exceed the upper bound.
+    exceed_mask = (
+        df_full["threshold"].notna()
+        & df_full["n_cases"].notna()
+        & (df_full["n_cases"] > df_full["threshold"])
+    )
+    exceed_df = df_full.loc[exceed_mask]
+    if not exceed_df.empty:
+        plt.scatter(
+            exceed_df.index,
+            exceed_df["n_cases"],
+            color="red",
+            edgecolors="darkred",
+            linewidths=0.6,
+            label="Exceeded Upper Bound",
+            zorder=6,
+            s=44,
+        )
+        plt.vlines(
+            exceed_df.index,
+            exceed_df["threshold"],
+            exceed_df["n_cases"],
+            colors="red",
+            alpha=0.35,
+            linewidth=1.0,
+            zorder=5,
+        )
 
     # Decorations
     plt.legend()
@@ -1703,6 +1829,10 @@ def process_json():
         safe_log(f"Rejected request from non-localhost: {request.remote_addr}")
         abort(403, description="Only localhost requests are allowed.")
 
+    if not R_AVAILABLE:
+        abort(500, description="R support is not available. Please verify R_HOME/rpy2 configuration.")
+    ensure_rpy2_conversion_context()
+
     # 2. check Content-Type
     if not request.is_json:
         safe_log(f"Invalid Content-Type: {request.content_type}")
@@ -1725,13 +1855,16 @@ def process_json():
 
   
 
-    # 5. read Parameters（with default values）
+    # 5. read Parametersï¼ˆwith default valuesï¼‰
     try:
         graph = received_data["graph"]
         safe_log(f"Graph type: {graph}")
 
         abnormalReportFlag = bool(graph.get("abnormalReportFlag", False))
         safe_log(f"abnormalReportFlag: {abnormalReportFlag}")
+
+        designFlag = bool(graph.get("designFlag", False))
+        safe_log(f"designFlag: {designFlag}")
 
         model = graph.get("model", "Farrington")
         datasource = graph.get("dataSource", "Covid-19 Deaths")
@@ -1748,14 +1881,14 @@ def process_json():
         baseline = None
 
         mkey = model.strip().lower()
-        if mkey in ("farrington", "bayes", "cdc"):
+        if mkey in ("farrington", "bayes", "cdc", "cusum"):
             yearback = int(graph.get("yearBack", 3))
         elif mkey == "boda":
             mc_munu = int(graph.get("mc_munu", 100))
-        elif mkey == "earsc1":
+        elif mkey in ("earsc1", "earsc2", "earsc3"):
             baseline = int(graph.get("baseline", 7))
 
-        # 打印/调试
+        
         safe_log(f"Model={model}, DataSource={datasource}, title: {title},"
                    f"yearBack={yearback}, mc_munu={mc_munu}, baseline={baseline}")
 
@@ -1788,9 +1921,13 @@ def process_json():
         
         safe_log(datasource)
         df = generate_data(datasource, threshold=threshold)
+        if df is None or df.empty:
+            raise ValueError(f"No usable data generated for datasource '{datasource}'.")
         df_full, predictions = fit_and_predict_df_full(
                         df=df,
+                        useTrainSplit=useTrainSplit,
                         train_split_ratio=trainSplitRatio,
+                        train_end_date=train_end_date,
                         model_name=model,
                         years_back=yearback,
                         mc_munu=mc_munu,
@@ -1805,38 +1942,56 @@ def process_json():
         is_abnormal = check_recent_abnormal(df_full, threshold)
         safe_log(f"Recent abnormal status: {is_abnormal}")
 
-        if abnormalReportFlag and is_abnormal:
-             plot_detection_df_full(
+        if designFlag:
+            plot_detection_df_full(
                   df_full=df_full,
                   predictions=predictions,
                   save_path=save_img_path,
                   plot_title=title,
                   xlabel='Date',
                   ylabel='Number of Cases',
-                  alpha=0.05
+                  alpha=0.05,
+                  business_threshold=threshold
              )
-
-             return jsonify({
+            return jsonify({
+                "status": "processed",
+                "message": "Design mode enabled; plot generated.",
+                "plot_path": save_img_path
+             }), 200
+        elif abnormalReportFlag and is_abnormal:
+            plot_detection_df_full(
+                  df_full=df_full,
+                  predictions=predictions,
+                  save_path=save_img_path,
+                  plot_title=title,
+                  xlabel='Date',
+                  ylabel='Number of Cases',
+                  alpha=0.05,
+                  business_threshold=threshold
+            )
+            return jsonify({
                 "status": "processed",
                 "abnormal": True,
                 "message": "Abnormal detected; plot generated.",
                 "plot_path": save_img_path
-                }), 200
+            }), 200
         elif not abnormalReportFlag:
-             plot_detection_df_full(
+            plot_detection_df_full(
                   df_full=df_full,
                   predictions=predictions,
                   save_path=save_img_path,
                   plot_title=title,
                   xlabel='Date',
                   ylabel='Number of Cases',
-                  alpha=0.05
-             )
-             return jsonify({
+                  alpha=0.05,
+                  business_threshold=threshold
+            )
+            return jsonify({
                 "status": "processed",
-                "abnormal": False,
-                "message": "No abnormal pattern detected."
-             }), 200
+                "abnormal": is_abnormal,
+                "message": "Abnormal report filter disabled; plot generated.",
+                "plot_path": save_img_path
+            }), 200
         else:
    
             return jsonify({
@@ -1847,6 +2002,8 @@ def process_json():
 
     except Exception as e:
         safe_log(f"Plot generation error: {e}")
+        safe_log(traceback.format_exc())
+        print(f"Plot generation error: {e}")
         abort(500, description=f"Plot generation failed: {e}")
 
    
@@ -1886,6 +2043,9 @@ def execute_code():
     code = received_data["code"]
     cell_type = received_data.get("cell_type", "code")
     language = received_data.get("language", "python")  # New field for language
+
+    if language.lower() in ["r", "both"] and R_AVAILABLE:
+        ensure_rpy2_conversion_context()
 
 
     safe_print(f"Executing {language} {cell_type} cell with code length: {len(code)}")
@@ -2122,7 +2282,7 @@ def add_variable():
         elif datasource in ["COVID-19 Deaths", "Pneumonia Deaths", "Flu Deaths"]:
             # Create a complete date range (daily frequency)
             # Use CDC data
-            df = generate_cdc_data(datasource, threshold=threshold)
+            df = generate_data(datasource, threshold=threshold)
             df['start_date'] = pd.to_datetime(df['start_date'])  # Ensure 'date' is datetime type
             df = df.set_index('start_date')
             df.index = pd.date_range(start=df.index[0], periods=len(df), freq='W-SUN')
@@ -2289,20 +2449,19 @@ def shutdown():
     This should only be used in controlled environments (not production).
     """
     func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        return jsonify({
-            "status": "error",
-            "message": "Not running with the Werkzeug Server"
-        }), 500
 
-    # 返回响应后再调用关闭函数
+    # 
     response = jsonify({
         "status": "ok",
         "message": "Server is shutting down",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
-    func()
+    if func is not None:
+        func()
+    else:
+        # Fallback for environments where werkzeug.server.shutdown is unavailable.
+        threading.Timer(0.2, lambda: os._exit(0)).start()
     return response
 
 @app.errorhandler(400)
@@ -2353,7 +2512,9 @@ if __name__ == '__main__':
          # Run the app:
          # host='127.0.0.1' ensures it only listens on the loopback interface.
          # ssl_context enables HTTPS.
-         app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
+         # rpy2 conversion context relies on contextvars; keep Flask single-threaded
+         # for deterministic behavior in this desktop-local server.
+         app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False, threaded=False)
     except ImportError:
          safe_log("Error: 'cryptography' library not found.")
          safe_log("Please install it for ad-hoc SSL certificate generation:")

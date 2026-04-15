@@ -28,6 +28,7 @@ using System.Globalization;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -1858,7 +1859,7 @@ namespace ForeSITETestApp
 
                 string plotTitle = dialog.PlotTitle;
 
-                string model = (ModelSelector.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Farrington";
+                string model = (ModelSelector.SelectedItem as Model)?.Name ?? "Farrington";
                 string dataSource = (DataSourceSelector.SelectedItem as DataSource)?.Name ?? "";
                 //string yearBack = (YearBackSelector.SelectedItem as ComboBoxItem)?.Content.ToString() ?? "5";
                 bool useTrainSplit = TrainSplitCheckBox.IsChecked ?? false;
@@ -1874,7 +1875,9 @@ namespace ForeSITETestApp
                 var sel = (Model)ModelSelector.SelectedItem;
                 var key = sel?.Name?.Trim().ToLowerInvariant() ?? "";
 
-                if (key == "farrington" || key == "bayes" || key == "cdc")
+                bool designFlag=true;
+
+                if (key == "farrington" || key == "bayes" || key == "cdc" || key == "cusum")
                 {
                     if (YearBackSelector.SelectedItem is ComboBoxItem item &&
                         int.TryParse(item.Content?.ToString(), out var yb))
@@ -1884,7 +1887,7 @@ namespace ForeSITETestApp
                 {
                     if (int.TryParse(TxtMcMunu.Text, out var v)) mcMunu = v;
                 }
-                else if (key == "earsc1")
+                else if (key == "earsc1" || key == "earsc2" || key == "earsc3")
                 {
                     if (int.TryParse(TxtBaseline.Text, out var b)) baseline = b;
                 }
@@ -1923,6 +1926,7 @@ namespace ForeSITETestApp
                     ["threshold"] = threshold,
                     ["title"] = plotTitle,
                     ["abnormalReportFlag"] = abnormalReportEnabled,
+                    ["designFlag"] = designFlag,
                 };
 
                 // 
@@ -1931,6 +1935,7 @@ namespace ForeSITETestApp
                     case "farrington":
                     case "bayes":
                     case "cdc":
+                    case "cusum":
                         if (yearsBack.HasValue)
                             graphData["yearBack"] = yearsBack.Value;
                         break;
@@ -1941,6 +1946,8 @@ namespace ForeSITETestApp
                         break;
 
                     case "earsc1":
+                    case "earsc2":
+                    case "earsc3":
                         if (baseline.HasValue)
                             graphData["baseline"] = baseline;
                         break;
@@ -2171,6 +2178,265 @@ namespace ForeSITETestApp
             catch (Exception ex)
             {
                 MessageBox.Show($"Error generating or adding plot: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async void ThresholdBacktestHelpButton_Click(object sender, RoutedEventArgs e)
+        {
+            string thresholdText = ThresholdInput.Text?.Trim() ?? string.Empty;
+            string selectedSource = (DataSourceSelector.SelectedItem as DataSource)?.Name ?? "COVID-19 Deaths";
+
+            if (selectedSource != "COVID-19 Deaths" &&
+                selectedSource != "Pneumonia Deaths" &&
+                selectedSource != "Flu Deaths")
+            {
+                MessageBox.Show(
+                    "Backtest currently supports these Data Sources only:\n- COVID-19 Deaths\n- Pneumonia Deaths\n- Flu Deaths",
+                    "Unsupported Data Source",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(thresholdText))
+            {
+                MessageBox.Show("Please enter a numeric value for Maximum threshold first.",
+                    "Threshold Required", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            if (!double.TryParse(thresholdText, NumberStyles.Float, CultureInfo.InvariantCulture, out double thresholdValue))
+            {
+                MessageBox.Show("Maximum threshold must be a valid number.",
+                    "Invalid Threshold", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            string baseDir = AppContext.BaseDirectory;
+            string serverDir = Path.Combine(baseDir, "Server");
+            string scriptPath = Path.Combine(serverDir, "cdc_backtest.py");
+            string configPath = Path.Combine(serverDir, "config.json");
+
+            if (!File.Exists(scriptPath))
+            {
+                MessageBox.Show($"Cannot find script:\n{scriptPath}",
+                    "Backtest Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            string pythonPath = "python";
+            string appToken = string.Empty;
+            try
+            {
+                if (File.Exists(configPath))
+                {
+                    var cfg = JObject.Parse(File.ReadAllText(configPath));
+                    pythonPath = cfg.Value<string>("pythonPath")?.Trim() ?? pythonPath;
+                    appToken =
+                        cfg.Value<string>("FORESITE_CDC_APP_TOKEN")?.Trim()
+                        ?? cfg.Value<string>("foresite_cdc_app_token")?.Trim()
+                        ?? cfg.Value<string>("cdcAppToken")?.Trim()
+                        ?? cfg.Value<string>("appToken")?.Trim()
+                        ?? string.Empty;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to read config.json:\n{ex.Message}",
+                    "Config Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+
+            if (string.IsNullOrWhiteSpace(appToken))
+            {
+                appToken = DBHelper.GetAllDataSources()
+                    .FirstOrDefault(ds => string.Equals(ds.Name, "COVID-19 Deaths", StringComparison.OrdinalIgnoreCase))
+                    ?.AppToken ?? string.Empty;
+            }
+
+            if (!File.Exists(pythonPath) && string.Equals(pythonPath, "python", StringComparison.OrdinalIgnoreCase) == false)
+            {
+                MessageBox.Show($"Python executable not found:\n{pythonPath}",
+                    "Backtest Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            ThresholdBacktestHelpButton.IsEnabled = false;
+            Mouse.OverrideCursor = Cursors.Wait;
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = pythonPath,
+                    WorkingDirectory = serverDir,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add(scriptPath);
+                psi.ArgumentList.Add("--state");
+                psi.ArgumentList.Add("United States");
+                psi.ArgumentList.Add("--source");
+                psi.ArgumentList.Add(selectedSource);
+                psi.ArgumentList.Add("--threshold");
+                psi.ArgumentList.Add(thresholdValue.ToString(CultureInfo.InvariantCulture));
+                psi.ArgumentList.Add("--truth-rule");
+                psi.ArgumentList.Add("percent_expected");
+                psi.ArgumentList.Add("--percent-threshold");
+                psi.ArgumentList.Add("110");
+                if (!string.IsNullOrWhiteSpace(appToken))
+                {
+                    psi.ArgumentList.Add("--app-token");
+                    psi.ArgumentList.Add(appToken);
+                }
+
+                using var process = new Process { StartInfo = psi };
+                process.Start();
+                Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+                Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                string stdout = (await stdoutTask).Trim();
+                string stderr = (await stderrTask).Trim();
+                if (process.ExitCode != 0)
+                {
+                    string errText = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
+                    ShowBacktestDialog("Backtest failed", errText);
+                    return;
+                }
+
+                JObject? metrics = TryExtractJsonObject(stdout);
+                if (metrics == null)
+                {
+                    ShowBacktestDialog("Backtest output", stdout);
+                    return;
+                }
+
+                string summary = metrics.ToString(Newtonsoft.Json.Formatting.Indented);
+                string comments = BuildBacktestComments(metrics);
+                ShowBacktestDialog(summary, comments);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to run backtest:\n{ex.Message}",
+                    "Backtest Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                Mouse.OverrideCursor = null;
+                ThresholdBacktestHelpButton.IsEnabled = true;
+            }
+        }
+
+        private static JObject? TryExtractJsonObject(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return null;
+
+            int start = text.IndexOf('{');
+            int end = text.LastIndexOf('}');
+            if (start < 0 || end <= start)
+                return null;
+
+            string json = text.Substring(start, end - start + 1);
+            try
+            {
+                return JObject.Parse(json);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string BuildBacktestComments(JObject metrics)
+        {
+            double precision = metrics.Value<double?>("precision") ?? 0.0;
+            double recall = metrics.Value<double?>("recall") ?? 0.0;
+            double f1 = metrics.Value<double?>("f1") ?? 0.0;
+            int fp = metrics.Value<int?>("FP") ?? 0;
+            int fn = metrics.Value<int?>("FN") ?? 0;
+
+            string performance = f1 >= 0.70
+                ? "Overall signal quality is strong for this threshold."
+                : f1 >= 0.50
+                    ? "Overall signal quality is moderate; threshold tuning may help."
+                    : "Overall signal quality is weak; consider retuning the threshold.";
+
+            string balance = precision >= recall
+                ? "Precision is higher than recall, so false positives are relatively controlled."
+                : "Recall is higher than precision, so the system is sensitive but may over-alert.";
+
+            string errorHint = fp > fn
+                ? "False positives exceed false negatives. You may increase threshold to reduce noise."
+                : fn > fp
+                    ? "False negatives exceed false positives. You may decrease threshold to catch more events."
+                    : "False positives and false negatives are balanced at this setting.";
+
+            return
+                "Comments\n" +
+                $"- {performance}\n" +
+                $"- {balance}\n" +
+                $"- {errorHint}\n" +
+                "- This summary is based on the percent_expected rule with percent-threshold=110 for United States.";
+        }
+
+        private static void ShowBacktestDialog(string summary, string comments)
+        {
+            Cursor? previousOverrideCursor = Mouse.OverrideCursor;
+            Mouse.OverrideCursor = null;
+
+            var dialog = new Window
+            {
+                Title = "CDC Backtest Summary",
+                Width = 760,
+                Height = 560,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                ResizeMode = ResizeMode.CanResize,
+                Cursor = Cursors.Arrow,
+                Content = new Grid
+                {
+                    Margin = new Thickness(12)
+                }
+            };
+
+            var grid = (Grid)dialog.Content;
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var textBox = new TextBox
+            {
+                IsReadOnly = true,
+                TextWrapping = TextWrapping.Wrap,
+                AcceptsReturn = true,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 13,
+                Text = $"Summary\n{summary}\n\n{comments}"
+            };
+            Grid.SetRow(textBox, 0);
+            grid.Children.Add(textBox);
+
+            var closeButton = new Button
+            {
+                Content = "Close",
+                Width = 90,
+                Margin = new Thickness(0, 10, 0, 0),
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right
+            };
+            closeButton.Click += (_, __) => dialog.Close();
+            Grid.SetRow(closeButton, 1);
+            grid.Children.Add(closeButton);
+
+            try
+            {
+                dialog.ShowDialog();
+            }
+            finally
+            {
+                Mouse.OverrideCursor = previousOverrideCursor;
             }
         }
 
@@ -2448,6 +2714,26 @@ namespace ForeSITETestApp
 
         private (int exit, string stdout, string stderr) RunSchTasks(string args, bool elevate = true)
         {
+            if (elevate)
+            {
+                var elevatedPsi = new ProcessStartInfo("schtasks", args)
+                {
+                    UseShellExecute = true,
+                    Verb = "runas"
+                };
+                using var elevatedProcess = Process.Start(elevatedPsi);
+                if (elevatedProcess == null)
+                {
+                    return (-1, string.Empty, "Failed to start elevated schtasks process.");
+                }
+
+                elevatedProcess.WaitForExit();
+                string error = elevatedProcess.ExitCode == 0
+                    ? string.Empty
+                    : $"schtasks failed with exit code {elevatedProcess.ExitCode}.";
+                return (elevatedProcess.ExitCode, string.Empty, error);
+            }
+
             var psi = new ProcessStartInfo("schtasks", args)
             {
                 RedirectStandardOutput = true,
@@ -2455,12 +2741,11 @@ namespace ForeSITETestApp
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            if (elevate) psi.Verb = "runas";   // trigger UAC
             using var p = Process.Start(psi);
             string output = p!.StandardOutput.ReadToEnd();
-            string error = p.StandardError.ReadToEnd();
+            string errorText = p.StandardError.ReadToEnd();
             p.WaitForExit();
-            return (p.ExitCode, output, error);
+            return (p.ExitCode, output, errorText);
         }
 
         // In SchedulerStart_Click, fix possible null reference for HourSelector/MinuteSelector.SelectedItem
@@ -2580,7 +2865,7 @@ namespace ForeSITETestApp
 
             ShowOnlyPanel(null);
 
-            if (key == "farrington" || key == "bayes" || key == "cdc")
+            if (key == "farrington" || key == "bayes" || key == "cdc" || key == "cusum")
             {
                 ShowOnlyPanel(YearBackPanel);
                 // default
@@ -2591,7 +2876,7 @@ namespace ForeSITETestApp
                 ShowOnlyPanel(BodaPanel);
                 if (string.IsNullOrWhiteSpace(TxtMcMunu.Text)) TxtMcMunu.Text = "100";
             }
-            else if (key == "earsc1")
+            else if (key == "earsc1" || key == "earsc2" || key == "earsc3")
             {
                 ShowOnlyPanel(EarsC1Panel);
                 if (string.IsNullOrWhiteSpace(TxtBaseline.Text)) TxtBaseline.Text = "7";
@@ -2644,12 +2929,40 @@ namespace ForeSITETestApp
         {
             public string baseUrl { get; set; } = "";
             public string apiKey { get; set; } = "";
+            public string apiKeyProtected { get; set; } = "";
         }
 
         private string GetLlmConfigPath()
         {
             // keep it next to the exe so Task Scheduler / installed app can find it consistently
             return Path.Combine(AppContext.BaseDirectory, LlmConfigFileName);
+        }
+
+        private static string ProtectApiKey(string plainText)
+        {
+            if (string.IsNullOrWhiteSpace(plainText))
+                return string.Empty;
+
+            byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+            byte[] encrypted = ProtectedData.Protect(plainBytes, null, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(encrypted);
+        }
+
+        private static string UnprotectApiKey(string cipherText)
+        {
+            if (string.IsNullOrWhiteSpace(cipherText))
+                return string.Empty;
+
+            try
+            {
+                byte[] encrypted = Convert.FromBase64String(cipherText);
+                byte[] plainBytes = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(plainBytes);
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         private string GetSystemConfigPath()
@@ -2795,7 +3108,20 @@ namespace ForeSITETestApp
                 if (cfg == null) return;
 
                 if (LlmBaseUrlBox != null) LlmBaseUrlBox.Text = cfg.baseUrl ?? "";
-                if (LlmApiKeyBox != null) LlmApiKeyBox.Password = cfg.apiKey ?? "";
+                string apiKey = !string.IsNullOrWhiteSpace(cfg.apiKey)
+                    ? cfg.apiKey
+                    : UnprotectApiKey(cfg.apiKeyProtected ?? string.Empty);
+
+                if (LlmApiKeyBox != null) LlmApiKeyBox.Password = apiKey;
+
+                // Auto-migrate legacy plaintext config to protected form.
+                if (!string.IsNullOrWhiteSpace(cfg.apiKey))
+                {
+                    cfg.apiKeyProtected = ProtectApiKey(cfg.apiKey);
+                    cfg.apiKey = string.Empty;
+                    string migrated = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
+                    File.WriteAllText(path, migrated);
+                }
             }
             catch (Exception ex)
             {
@@ -2811,7 +3137,8 @@ namespace ForeSITETestApp
                 var cfg = new LlmConfig
                 {
                     baseUrl = LlmBaseUrlBox?.Text?.Trim() ?? "",
-                    apiKey = LlmApiKeyBox?.Password?.Trim() ?? ""
+                    apiKey = string.Empty,
+                    apiKeyProtected = ProtectApiKey(LlmApiKeyBox?.Password?.Trim() ?? string.Empty)
                 };
 
                 string json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
